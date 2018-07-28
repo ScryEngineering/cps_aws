@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  DomainName:
+    Description: Domain name to deploy to (e.g. www.example.com)
+    Type: String
+  BucketName:
+    Description: Bucket name to create and deploy to
+    Type: String
+  RedirectDomainNames:
+    Description: List of alternate domains to redirect to the deployment domain (e.g.
+      example.com,www.example.net,example.net). You can specify at most two different
+      sets of domains that you control (i.e. have email access to)
+    Type: CommaDelimitedList
+  ValidationDomainName:
+    Description: Domain name to use to validate main domain of certificate (e.g. example.com)
+    Type: String
+  SecondValidationDomainName:
+    Description: Domain name to use to validate set domain of certificate (e.g. example.net)
+    Type: String
+  LogBucketName:
+    Description: Bucket name to use for CloudFront logs (leave blank for no logging)
+    Type: String
+  HostedZoneID:
+    Description: ID of Route 53 hosted zone. Leave blank to not have DNS record set
+      (redirect records have to be manually set)
+    Type: String
+Conditions:
+  HasRedirectDomains: !Not
+    - !Equals
+      - ''
+      - !Select
+        - 0
+        - !Ref 'RedirectDomainNames'
+  HasSecondValidationDomainName: !Not
+    - !Equals
+      - ''
+      - !Ref 'SecondValidationDomainName'
+  Logging: !Not
+    - !Equals
+      - ''
+      - !Ref 'LogBucketName'
+  HostedZoneIDSet: !Not
+    - !Equals
+      - ''
+      - !Ref 'HostedZoneID'
+Resources:
+  CertificateManagerCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref 'DomainName'
+      DomainValidationOptions:
+        - DomainName: !Ref 'DomainName'
+          ValidationDomain: !Ref 'ValidationDomainName'
+        - !If
+          - HasSecondValidationDomainName
+          - DomainName: !Select
+              - 0
+              - !Ref 'RedirectDomainNames'
+            ValidationDomain: !Ref 'SecondValidationDomainName'
+          - !Ref 'AWS::NoValue'
+      SubjectAlternativeNames: !If
+        - HasRedirectDomains
+        - !Ref 'RedirectDomainNames'
+        - !Ref 'AWS::NoValue'
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref 'BucketName'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+  S3LogBucket:
+    Type: AWS::S3::Bucket
+    Condition: Logging
+    Properties:
+      BucketName: !Ref 'LogBucketName'
+  S3RedirectBucket:
+    Type: AWS::S3::Bucket
+    Condition: HasRedirectDomains
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref 'BucketName'
+          - redirect
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Ref 'DomainName'
+          Protocol: https
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: S3AllowPublicReadGetObject
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref 'S3Bucket'
+                - /*
+      Bucket: !Ref 'S3Bucket'
+  RedirectBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasRedirectDomains
+    Properties:
+      PolicyDocument:
+        Id: S3AllowPublicReadGetObject
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref 'S3RedirectBucket'
+                - /*
+      Bucket: !Ref 'S3RedirectBucket'
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Select [2, !Split ["/", !GetAtt 'S3Bucket.WebsiteURL']]
+            Id: S3BucketOrigin
+            CustomOriginConfig:
+              HTTPPort: '80'
+              HTTPSPort: '443'
+              OriginProtocolPolicy: http-only
+        HttpVersion: http2
+        Logging: !If
+          - Logging
+          - IncludeCookies: 'true'
+            Bucket: !GetAtt 'S3LogBucket.DomainName'
+            Prefix: !If
+              - HasRedirectDomains
+              - site
+              - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+        Enabled: 'true'
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref 'DomainName'
+        DefaultCacheBehavior:
+          TargetOriginId: S3BucketOrigin
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        ViewerCertificate:
+          AcmCertificateArn: !Ref 'CertificateManagerCertificate'
+          MinimumProtocolVersion: TLSv1.1_2016
+          SslSupportMethod: sni-only
+    DependsOn:
+      - S3Bucket
+      - CertificateManagerCertificate
+  CloudFrontRedirectDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: HasRedirectDomains
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Select [2, !Split ["/", !GetAtt 'S3RedirectBucket.WebsiteURL']]
+            Id: S3RedirectBucketOrigin
+            CustomOriginConfig:
+              HTTPPort: '80'
+              HTTPSPort: '443'
+              OriginProtocolPolicy: http-only
+        HttpVersion: http2
+        Logging: !If
+          - Logging
+          - IncludeCookies: 'true'
+            Bucket: !GetAtt 'S3LogBucket.DomainName'
+            Prefix: redirect
+          - !Ref 'AWS::NoValue'
+        Enabled: 'true'
+        DefaultRootObject: index.html
+        Aliases: !Ref 'RedirectDomainNames'
+        DefaultCacheBehavior:
+          TargetOriginId: S3RedirectBucketOrigin
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: allow-all
+        ViewerCertificate:
+          AcmCertificateArn: !Ref 'CertificateManagerCertificate'
+          MinimumProtocolVersion: TLSv1.1_2016
+          SslSupportMethod: sni-only
+    DependsOn:
+      - S3RedirectBucket
+      - CertificateManagerCertificate
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HostedZoneIDSet
+    Properties:
+      HostedZoneId: !Ref 'HostedZoneID'
+      RecordSets:
+        - Name: !Ref 'DomainName'
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt 'CloudFrontDistribution.DomainName'
+Outputs:
+  CloudFrontEndpoint:
+    Description: CNAME for CloudFront distribution
+    Value: !GetAtt 'CloudFrontDistribution.DomainName'
+  CloudFrontRedirectEndpoint:
+    Description: CNAME for CloudFront distribution for redirecting domains
+    Value: !GetAtt 'CloudFrontRedirectDistribution.DomainName'
+    Condition: HasRedirectDomains
